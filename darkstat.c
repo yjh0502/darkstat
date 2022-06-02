@@ -68,6 +68,10 @@ static unsigned long parsenum(const char *str,
    return n;
 }
 
+static int opt_netflow_port = 0;
+static void cb_netflow(const char *arg)
+{ opt_netflow_port = (int)parsenum(arg, 0); }
+
 static int opt_iface_seen = 0;
 static void cb_interface(const char *arg) {
    cap_add_ifname(arg);
@@ -188,6 +192,7 @@ struct cmdline_arg {
 };
 
 static struct cmdline_arg cmdline_args[] = {
+   {"--netflow",      "netflow_port",    cb_netflow,      0},
    {"-i",             "interface",       cb_interface,   -1},
    {"-f",             "filter",          cb_filter,      -1},
    {"-r",             "capfile",         cb_capfile,      0},
@@ -311,11 +316,13 @@ static void parse_cmdline(const int argc, char * const *argv) {
       opt_privdrop_user = PRIVDROP_USER;
 
    /* sanity check args */
-   if (!opt_iface_seen && opt_capfile == NULL)
-      errx(1, "must specify either interface (-i) or capture file (-r)");
+   if (!opt_netflow_port && !opt_iface_seen && opt_capfile == NULL)
+     errx(1, "must specify either interface (-i), capture file (-r), or "
+             "netflow (--netflow)");
 
-   if (opt_iface_seen && opt_capfile != NULL)
-      errx(1, "can't specify both interface (-i) and capture file (-r)");
+   if (opt_netflow_port && opt_iface_seen && opt_capfile != NULL)
+     errx(1, "can't specify both interface (-i), capture file (-r), and "
+             "netflow (--netflow)");
 
    if ((opt_hosts_max != 0) && (opt_hosts_keep >= opt_hosts_max)) {
       opt_hosts_keep = opt_hosts_max / 2;
@@ -385,7 +392,13 @@ main(int argc, char **argv)
 
    /* do this first as it forks - minimize memory use */
    if (opt_want_dns) dns_init(opt_privdrop_user);
-   cap_start(opt_want_promisc); /* needs root */
+
+   if (opt_netflow_port) {
+     netflow_start(opt_netflow_port);
+   } else {
+     cap_start(opt_want_promisc); /* needs root */
+   }
+
    http_init_base(opt_base);
    http_listen(opt_bindport);
    ncache_init(); /* must do before chroot() */
@@ -415,14 +428,18 @@ main(int argc, char **argv)
       int select_ret;
       int max_fd = -1;
       int use_timeout = 0;
-      int cap_ret;
+      int src_ret;
       struct timeval timeout;
       struct timespec t;
       fd_set rs, ws;
 
       FD_ZERO(&rs);
       FD_ZERO(&ws);
-      cap_fd_set(&rs, &max_fd, &timeout, &use_timeout);
+      if (opt_netflow_port) {
+         netflow_fd_set(&rs, &max_fd, &timeout, &use_timeout);
+      } else {
+         cap_fd_set(&rs, &max_fd, &timeout, &use_timeout);
+      }
       http_fd_set(&rs, &ws, &max_fd, &timeout, &use_timeout);
 
       select_ret = select(max_fd+1, &rs, &ws, NULL,
@@ -454,13 +471,18 @@ main(int argc, char **argv)
       }
 
       graph_rotate();
-      cap_ret = cap_poll(&rs);
+      if (opt_netflow_port) {
+         src_ret = netflow_poll(&rs);
+      } else {
+         src_ret = cap_poll(&rs);
+      }
+
       dns_poll();
       http_poll(&rs, &ws);
       timer_stop(&t, 1000000000, "event processing took longer than a second");
 
-      if (!cap_ret) {
-         running = 0;
+      if (!src_ret) {
+        running = 0;
       }
    }
 

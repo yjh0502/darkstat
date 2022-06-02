@@ -22,6 +22,7 @@
 #include "queue.h"
 #include "str.h"
 
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -35,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 char *title_interfaces = NULL; /* for html.c */
 
@@ -536,6 +538,172 @@ void cap_from_file(const char *capfile) {
 
    localip_free(&iface.local_ips);
    pcap_close(iface.pcap);
+}
+
+static int netflowfd = -1;
+
+// NETFLOW
+int netflow_start(ushort port) {
+   struct str *ifs = str_make();
+
+   struct sockaddr_in listenaddr;
+
+   // Creating socket file descriptor
+   if ((netflowfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+      errx(1, "netflow_start: socket");
+   }
+
+   memset(&listenaddr, 0, sizeof(listenaddr));
+
+   // Filling server information
+   listenaddr.sin_family = AF_INET; // IPv4
+   listenaddr.sin_addr.s_addr = INADDR_ANY;
+   listenaddr.sin_port = htons(port);
+
+   verbosef("netflow: listening on port %d", port);
+
+   // Bind the socket with the server address
+   int ret = bind(netflowfd, (const struct sockaddr *)&listenaddr,
+                  sizeof(listenaddr));
+   if (ret < 0)
+      errx(1, "netflow_start: bind: %d", ret);
+
+   struct timeval read_timeout;
+   read_timeout.tv_sec = 0;
+   read_timeout.tv_usec = 10;
+   setsockopt(netflowfd, SOL_SOCKET, SO_RCVTIMEO, &read_timeout, sizeof read_timeout);
+
+   str_appendn(ifs, "", 1); /* NUL terminate */
+   {
+      size_t _;
+      str_extract(ifs, &_, &title_interfaces);
+   }
+
+   return 0;
+}
+
+/*
+ * Set pcap_fd in the given fd_set.
+ */
+void netflow_fd_set(fd_set *read_set,
+                int *max_fd,
+                struct timeval *timeout _unused_otherwise_,
+                int *need_timeout) {
+   assert(*need_timeout == 0); /* we're first to get a shot at the fd_set */
+
+   FD_SET(netflowfd, read_set);
+   *max_fd = MAX(*max_fd, netflowfd);
+}
+
+#define MAXLINE 2048
+
+struct __attribute__((__packed__)) netflow_msghdr {
+   uint16_t version;
+   uint16_t len;
+   uint32_t sys_uptime;
+   uint32_t unix_secs;
+   uint32_t unix_nsecs;
+   uint32_t flow_sequence;
+   uint8_t engine_type;
+   uint8_t engine_id;
+   uint16_t sampling_interval;
+};
+
+struct __attribute__((__packed__)) netflow_record {
+   uint32_t srcaddr;
+   uint32_t dstaddr;
+   uint32_t nexthop;
+   uint16_t input;
+   uint16_t output;
+   uint32_t dPkts;
+   uint32_t dOctets;
+   uint32_t first;
+   uint32_t last;
+   uint16_t srcport;
+   uint16_t dstport;
+   uint8_t pad1;
+   uint8_t tcp_flags;
+   uint8_t prot;
+   uint8_t tos;
+   uint16_t src_as;
+   uint16_t dst_as;
+   uint8_t src_mask;
+   uint8_t dst_mask;
+   uint16_t pad2;
+};
+
+int netflow_poll_read(void);
+
+int netflow_poll(fd_set *read_set) {
+   if (!FD_ISSET(netflowfd, read_set))
+      return 1;
+
+   verbosef("netflow_poll: fd=%d", netflowfd);
+
+   for (;;) {
+      int ret = netflow_poll_read();
+      if (ret == 0) {
+         break;
+      }
+   }
+   return 1;
+}
+
+int netflow_poll_read(void) {
+   char buffer[MAXLINE];
+   int n = recv(netflowfd, (char *)buffer, MAXLINE,0);
+   if (n < 0) {
+      if (errno == EAGAIN)
+         return 0;
+      err(1, "netflow_poll_read: recv");
+   }
+
+   struct netflow_msghdr *hdr = (struct netflow_msghdr *)&buffer;
+   hdr->version = ntohs(hdr->version);
+   hdr->len = ntohs(hdr->len);
+   hdr->sys_uptime = ntohl(hdr->sys_uptime);
+   hdr->unix_secs = ntohl(hdr->unix_secs);
+   hdr->unix_nsecs = ntohl(hdr->unix_nsecs);
+   hdr->sampling_interval = ntohs(hdr->sampling_interval);
+
+   verbosef("netflow_poll_read: version=%u, len=%u, uptime=%u, secs=%u, seq=%u",
+            hdr->version, hdr->len, hdr->sys_uptime, hdr->unix_secs,
+            hdr->flow_sequence);
+
+   struct netflow_record *records = (struct netflow_record *)&buffer[sizeof(*hdr)];
+
+   struct pktsummary sm;
+   memset(&sm, 0, sizeof(sm));
+
+   struct local_ips local_ips;
+   localip_init(&local_ips);
+
+   for (int i = 0; i < hdr->len; i++) {
+      struct netflow_record record = records[i];
+
+      sm.src.family = IPv4;
+      sm.src.ip.v4 = record.srcaddr;
+
+      sm.dst.family = IPv4;
+      sm.dst.ip.v4 = record.dstaddr;
+
+      sm.len = ntohl(record.dOctets);
+      sm.proto = record.prot;
+      sm.tcp_flags = record.tcp_flags;
+      sm.src_port = ntohs(record.srcport);
+      sm.dst_port = ntohs(record.dstport);
+
+      acct_for(&sm, &local_ips);
+   }
+
+   localip_free(&local_ips);
+
+   return n;
+}
+
+void netflow_stop(void) {
+   free(title_interfaces);
+   title_interfaces = NULL;
 }
 
 /* vim:set ts=3 sw=3 tw=78 expandtab: */

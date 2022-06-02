@@ -21,4 +21,9 @@ void cap_free_args(void);
 
 void cap_from_file(const char *capfile);
 
+int netflow_start(ushort port);
+void netflow_fd_set(fd_set *read_set, int *max_fd,
+   struct timeval *timeout, int *need_timeout);
+int netflow_poll(fd_set *read_set);
+
 /* vim:set ts=3 sw=3 tw=78 expandtab: */
